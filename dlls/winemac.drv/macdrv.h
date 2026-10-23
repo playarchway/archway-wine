@@ -262,6 +262,7 @@ struct macdrv_client_surface
 
 extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
 extern bool macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface);
+extern void d3dmetal_update_client_view(HWND hwnd, const struct window_rects *rects);
 
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
 extern void release_win_data(struct macdrv_win_data *data);

@@ -1856,6 +1856,7 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 
 done:
     release_win_data(data);
+    d3dmetal_update_client_view(hwnd, new_rects);
     root = NtUserGetAncestor(hwnd, GA_ROOT);
     if (root && root != hwnd && (root_data = get_win_data(root)))
     {
