@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 110
+#define WINE_GDI_DRIVER_VERSION 115
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -302,6 +302,9 @@ struct window_surface_funcs
                     const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
                     const BITMAPINFO *shape_info, const void *shape_bits );
     void  (*destroy)( struct window_surface *surface );
+    BOOL  (*begin_pixel_access)( struct window_surface *surface );
+    void  (*end_pixel_access)( struct window_surface *surface );
+    BOOL  (*is_current)( struct window_surface *surface );
 };
 
 struct window_surface
@@ -322,11 +325,15 @@ struct window_surface
     HRGN                               shape_region; /* shape of the window surface, unshaped if 0 */
     HBITMAP                            shape_bitmap; /* bitmap for the surface shape (1bpp) */
     HBITMAP                            color_bitmap; /* bitmap for the surface colors */
+    UINT64                             shared_id[3]; /* process-independent lock identity, zero for local surfaces */
+    BOOL                               flush_immediately; /* foreign surfaces are not in the owner flush list */
     /* driver-specific fields here */
 };
 
 W32KAPI struct window_surface *window_surface_create( const struct window_surface_funcs *funcs, HWND hwnd,
                                                       const RECT *rect, BITMAPINFO *info, HBITMAP bitmap );
+W32KAPI struct window_surface *window_surface_create_existing( const struct window_surface_funcs *funcs, HWND hwnd,
+                                                               const RECT *rect, BITMAPINFO *info, HBITMAP bitmap );
 W32KAPI void window_surface_add_ref( struct window_surface *surface );
 W32KAPI void window_surface_release( struct window_surface *surface );
 W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region );
@@ -428,10 +435,13 @@ struct user_driver_funcs
     void    (*pUpdateLayeredWindow)(HWND,BYTE,UINT);
     LRESULT (*pWindowMessage)(HWND,UINT,WPARAM,LPARAM);
     BOOL    (*pWindowPosChanging)(HWND,UINT,BOOL,const struct window_rects *);
+    BOOL    (*pAllowDetachedChildSurface)(HWND);
     BOOL    (*pGetWindowStyleMasks)(HWND,UINT,UINT,UINT*,UINT*);
     BOOL    (*pGetWindowStateUpdates)(HWND,UINT*,UINT*,RECT*,HWND*);
     struct client_surface *(*pCreateClientSurface)(HWND,int,BOOL);
     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
+    struct window_surface *(*pGetForeignWindowSurface)(HWND,struct window_surface *,BOOL *retry);
+    BOOL    (*pWindowSurfaceChanged)(HWND,struct window_surface *,struct window_surface *);
     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
     void    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
     /* system parameters */

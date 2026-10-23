@@ -136,6 +136,9 @@ enum macdrv_window_messages
     WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS,
     WM_MACDRV_CREATE_REMOTE_LAYER,
     WM_MACDRV_RELEASE_REMOTE_LAYER,
+    WM_MACDRV_CREATE_GDI_LAYER,
+    WM_MACDRV_RELEASE_GDI_LAYER,
+    WM_MACDRV_SHARED_GDI_DIRTY,
 };
 
 struct macdrv_thread_data
@@ -197,6 +200,11 @@ extern BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, con
 extern BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask);
 extern struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, BOOL raw);
 extern BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
+extern struct window_surface *macdrv_GetForeignWindowSurface(HWND hwnd, struct window_surface *previous, BOOL *retry);
+extern BOOL macdrv_WindowSurfaceChanged(HWND hwnd, struct window_surface *old_surface, struct window_surface *new_surface);
+extern void macdrv_PresentSharedWindowSurface(HWND hwnd, ULONG tag);
+extern BOOL macdrv_AllowDetachedChildSurface(HWND hwnd);
+extern void macdrv_publish_gdi_surface(struct window_surface *surface);
 extern void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                     const struct window_rects *new_rects, struct window_surface *surface);
 extern void macdrv_DestroyCursorIcon(HCURSOR cursor);
@@ -233,6 +241,7 @@ struct macdrv_win_data
     HWND                hwnd;                   /* hwnd that this private data belongs to */
     WineWindow         *cocoa_window;
     WineContentView    *client_view;
+    struct window_surface *gdi_surface;
     struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
     HANDLE              drag_event;             /* event to signal that Cocoa-driven window dragging has ended */
     unsigned int        on_screen : 1;          /* is window ordered in? (minimized or not) */

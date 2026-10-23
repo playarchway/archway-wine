@@ -442,6 +442,125 @@ static void sync_window_min_max_info(HWND hwnd)
  *
  * Create the whole Mac window for a given window
  */
+struct remote_gdi_host
+{
+    HWND root, child;
+    unsigned int context_id;
+};
+
+static struct remote_gdi_host *remote_gdi_hosts;
+static unsigned int remote_gdi_host_count, remote_gdi_host_capacity;
+static pthread_mutex_t remote_gdi_hosts_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void set_remote_gdi_host(HWND root, HWND child, unsigned int context_id, BOOL add)
+{
+    unsigned int i;
+
+    pthread_mutex_lock(&remote_gdi_hosts_mutex);
+    for (i = 0; i < remote_gdi_host_count; i++)
+        if (remote_gdi_hosts[i].root == root && remote_gdi_hosts[i].child == child &&
+            remote_gdi_hosts[i].context_id == context_id) break;
+    if (i < remote_gdi_host_count)
+    {
+        if (!add) remote_gdi_hosts[i] = remote_gdi_hosts[--remote_gdi_host_count];
+    }
+    else if (add)
+    {
+        if (remote_gdi_host_count == remote_gdi_host_capacity)
+        {
+            unsigned int capacity = max(8, remote_gdi_host_capacity * 2);
+            struct remote_gdi_host *hosts = realloc(remote_gdi_hosts, capacity * sizeof(*hosts));
+            if (!hosts) goto done;
+            remote_gdi_hosts = hosts;
+            remote_gdi_host_capacity = capacity;
+        }
+        remote_gdi_hosts[remote_gdi_host_count++] = (struct remote_gdi_host){root, child, context_id};
+    }
+done:
+    pthread_mutex_unlock(&remote_gdi_hosts_mutex);
+}
+
+static struct remote_gdi_host *copy_remote_gdi_hosts(HWND root, unsigned int *count)
+{
+    struct remote_gdi_host *copy;
+    unsigned int i;
+
+    *count = 0;
+    pthread_mutex_lock(&remote_gdi_hosts_mutex);
+    for (i = 0; i < remote_gdi_host_count; i++)
+        if (remote_gdi_hosts[i].root == root) ++*count;
+    if (!(copy = malloc(max(1, *count) * sizeof(*copy)))) goto done;
+    *count = 0;
+    for (i = 0; i < remote_gdi_host_count; i++)
+        if (remote_gdi_hosts[i].root == root) copy[(*count)++] = remote_gdi_hosts[i];
+done:
+    pthread_mutex_unlock(&remote_gdi_hosts_mutex);
+    return copy;
+}
+
+static BOOL gdi_host_paint_order(HWND parent, HWND target, unsigned int *index)
+{
+    HWND child = NtUserGetWindowRelative(parent, GW_CHILD);
+
+    if (child) child = NtUserGetWindowRelative(child, GW_HWNDLAST);
+    for (; child; child = NtUserGetWindowRelative(child, GW_HWNDPREV))
+    {
+        ++*index;
+        if (child == target || gdi_host_paint_order(child, target, index)) return TRUE;
+    }
+    return FALSE;
+}
+
+static void place_remote_gdi_host(struct macdrv_win_data *data, HWND child, unsigned int context_id)
+{
+    RECT rect, clip, parent_rect, visible = data->rects.visible;
+    UINT dpi = NtUserGetWinMonitorDpi(child, MDT_RAW_DPI);
+    unsigned int z = 0;
+    HWND parent;
+
+    if (!data->cocoa_window) return;
+    if (!NtUserIsWindow(child) || NtUserGetAncestor(child, GA_ROOT) != data->hwnd)
+    {
+        macdrv_window_release_ca_layer_host_view(data->cocoa_window, context_id);
+        set_remote_gdi_host(data->hwnd, child, context_id, FALSE);
+        return;
+    }
+
+    gdi_host_paint_order(data->hwnd, child, &z);
+    if (!NtUserGetWindowRect(child, &rect, dpi)) return;
+    clip = rect;
+    for (parent = NtUserGetAncestor(child, GA_PARENT); parent && parent != data->hwnd;
+         parent = NtUserGetAncestor(parent, GA_PARENT))
+    {
+        if (!NtUserGetClientRect(parent, &parent_rect, dpi)) break;
+        NtUserMapWindowPoints(parent, 0, (POINT *)&parent_rect, 2, dpi);
+        intersect_rect(&clip, &clip, &parent_rect);
+    }
+    if (parent == data->hwnd && NtUserGetClientRect(parent, &parent_rect, dpi))
+    {
+        NtUserMapWindowPoints(parent, 0, (POINT *)&parent_rect, 2, dpi);
+        intersect_rect(&clip, &clip, &parent_rect);
+    }
+    if (!NtUserIsWindowVisible(child) ||
+        rect.right - rect.left <= 1 || rect.bottom - rect.top <= 1)
+        SetRectEmpty(&clip);
+    OffsetRect(&rect, -visible.left, -visible.top);
+    OffsetRect(&clip, -visible.left, -visible.top);
+    macdrv_window_create_ca_layer_host_view_frame(data->cocoa_window, context_id,
+                                                  cgrect_mac_from_win(cgrect_from_rect(rect)),
+                                                  cgrect_mac_from_win(cgrect_from_rect(clip)), z);
+}
+
+static void update_remote_gdi_hosts(struct macdrv_win_data *data)
+{
+    struct remote_gdi_host *hosts;
+    unsigned int count, i;
+
+    if (!(hosts = copy_remote_gdi_hosts(data->hwnd, &count))) return;
+    for (i = 0; i < count; i++) place_remote_gdi_host(data, hosts[i].child, hosts[i].context_id);
+    free(hosts);
+}
+
 static void create_cocoa_window(struct macdrv_win_data *data)
 {
     struct macdrv_thread_data *thread_data = macdrv_init_thread_data();
@@ -477,6 +596,8 @@ static void create_cocoa_window(struct macdrv_win_data *data)
 
     data->cocoa_window = macdrv_create_cocoa_window(&wf, frame, data->hwnd, thread_data->queue);
     if (!data->cocoa_window) goto done;
+
+    update_remote_gdi_hosts(data);
 
     set_cocoa_window_properties(data);
 
@@ -1258,14 +1379,24 @@ LRESULT macdrv_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 void macdrv_DestroyWindow(HWND hwnd)
 {
     struct macdrv_win_data *data;
+    struct remote_gdi_host *hosts;
+    unsigned int count, i;
 
     TRACE("%p\n", hwnd);
+
+    if ((hosts = copy_remote_gdi_hosts(hwnd, &count)))
+    {
+        for (i = 0; i < count; i++) set_remote_gdi_host(hwnd, hosts[i].child, hosts[i].context_id, FALSE);
+        free(hosts);
+    }
 
     if (!(data = get_win_data(hwnd))) return;
 
     if (data->drag_event) NtSetEvent(data->drag_event, NULL);
 
     destroy_cocoa_window(data);
+
+    if (data->gdi_surface) window_surface_release(data->gdi_surface);
 
     CFDictionaryRemoveValue(win_datas, hwnd);
     release_win_data(data);
@@ -1564,6 +1695,26 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             release_win_data(data);
         }
         return 0;
+    case WM_MACDRV_CREATE_GDI_LAYER:
+        set_remote_gdi_host(hwnd, (HWND)wp, (unsigned int)lp, TRUE);
+        if ((data = get_win_data(hwnd)))
+        {
+            place_remote_gdi_host(data, (HWND)wp, (unsigned int)lp);
+            release_win_data(data);
+        }
+        return 0;
+    case WM_MACDRV_RELEASE_GDI_LAYER:
+        set_remote_gdi_host(hwnd, (HWND)wp, (unsigned int)lp, FALSE);
+        if ((data = get_win_data(hwnd)))
+        {
+            if (data->cocoa_window)
+                macdrv_window_release_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
+            release_win_data(data);
+        }
+        return 0;
+    case WM_MACDRV_SHARED_GDI_DIRTY:
+        macdrv_PresentSharedWindowSurface(hwnd, (ULONG)wp);
+        return 0;
     }
 
     FIXME("unrecognized window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (unsigned long)wp, lp);
@@ -1596,10 +1747,20 @@ BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const stru
     if (!data && !(data = macdrv_create_win_data(hwnd, rects))) return FALSE; /* use default surface */
     data->shaped = shaped;
 
-    ret = !!data->cocoa_window; /* use default surface if we don't have a window */
+    ret = !!data->cocoa_window || macdrv_AllowDetachedChildSurface(hwnd);
     release_win_data(data);
 
     return ret;
+}
+
+BOOL macdrv_AllowDetachedChildSurface(HWND hwnd)
+{
+    HWND parent = NtUserGetAncestor(hwnd, GA_PARENT);
+    DWORD pid = 0;
+
+    if (!parent || parent == NtUserGetDesktopWindow()) return FALSE;
+    NtUserGetWindowThread(parent, &pid);
+    return pid && pid != GetCurrentProcessId();
 }
 
 
@@ -1634,11 +1795,14 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 {
     BOOL fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     struct macdrv_thread_data *thread_data;
-    struct macdrv_win_data *data;
+    struct macdrv_win_data *data, *root_data;
+    HWND root;
     unsigned int new_style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     struct window_rects old_rects;
 
     if (!(data = get_win_data(hwnd))) return;
+
+    macdrv_publish_gdi_surface(surface);
 
     thread_data = macdrv_thread_data();
 
@@ -1688,8 +1852,16 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
         data->fullscreen = fullscreen;
     }
 
+    if (data->cocoa_window) update_remote_gdi_hosts(data);
+
 done:
     release_win_data(data);
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    if (root && root != hwnd && (root_data = get_win_data(root)))
+    {
+        update_remote_gdi_hosts(root_data);
+        release_win_data(root_data);
+    }
 }
 
 

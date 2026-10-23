@@ -2243,7 +2243,8 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
 
     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
-    else if (is_child) needs_surface = FALSE;
+    else if (is_child && (is_current_process_window( parent ) || shaped || (ex_style & WS_EX_LAYERED) ||
+                          !user_driver->pAllowDetachedChildSurface( hwnd ))) needs_surface = FALSE;
     else if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
     else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
     else needs_surface = !!(style & WS_VISIBLE);
@@ -2436,6 +2437,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     if (ret)
     {
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
+        if (old_surface != new_surface && old_surface)
+            if (!user_driver->pWindowSurfaceChanged( hwnd, old_surface, NULL )) valid_rects = NULL;
         register_window_surface( old_surface, new_surface );
         if (old_surface)
         {
@@ -2484,6 +2487,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
                 move_window_bits( hwnd, new_rects, valid_rects );
             }
         }
+
+        if (old_surface != new_surface && new_surface)
+            user_driver->pWindowSurfaceChanged( hwnd, NULL, new_surface );
 
         if (need_icons && (icon = get_window_icon_info( hwnd, ICON_BIG, icon, &ii )))
         {
@@ -5527,6 +5533,7 @@ LRESULT destroy_window( HWND hwnd )
     NtUserDestroyMenu( sys_menu );
     if (surface)
     {
+        user_driver->pWindowSurfaceChanged( hwnd, surface, NULL );
         register_window_surface( surface, NULL );
         window_surface_release( surface );
     }

@@ -508,9 +508,14 @@ extern WineMetalSwapChain_id macdrv_create_offscreen_swapchain(void* hwnd, CGRec
 extern CAMetalLayer *macdrv_swapchain_get_layer(WineMetalSwapChain_id swapchain);
 extern void macdrv_destroy_swapchain(WineMetalSwapChain_id swapchain);
 extern void macdrv_window_create_ca_layer_host_view(WineWindow *window, unsigned int context_id);
+extern void macdrv_window_create_ca_layer_host_view_frame(WineWindow *window, unsigned int context_id, CGRect frame, CGRect clip, float z);
 extern void macdrv_window_release_ca_layer_host_view(WineWindow *window, unsigned int context_id);
 extern void macdrv_create_remote_layer(void* hwnd, unsigned int context_id);
 extern void macdrv_release_remote_layer(void* hwnd, unsigned int context_id);
+extern void *macdrv_create_gdi_context(CGRect bounds);
+extern unsigned int macdrv_gdi_context_id(void *context);
+extern void macdrv_gdi_context_set_image(void *context, CGImageRef image);
+extern void macdrv_destroy_gdi_context(void *context);
 extern bool macdrv_get_view_backing_size(WineContentView *view, int backing_size[2]);
 extern void macdrv_set_view_backing_size(WineContentView *view, const int backing_size[2]);
 extern uint32_t macdrv_window_background_color(void);

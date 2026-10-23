@@ -256,6 +256,7 @@ static inline BOOL stage_manager_enabled(void)
 
     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device;
     - (void) addCALayerHostViewWithContextId:(CAContextID)contextId;
+    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame clip:(CGRect)clip zPosition:(CGFloat)zPosition;
     - (void) removeCALayerHostView:(CAContextID)contextId;
 
 @end
@@ -573,20 +574,54 @@ static inline BOOL stage_manager_enabled(void)
 
     - (void) addCALayerHostViewWithContextId:(CAContextID)contextId
     {
+        [self addCALayerHostViewWithContextId:contextId frame:CGRectNull clip:CGRectNull zPosition:0];
+    }
+
+    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame clip:(CGRect)clip zPosition:(CGFloat)zPosition
+    {
+        CALayerHost* host;
+        CGRect bounds = self.layer.bounds;
+        CGRect top_frame = frame;
+        CGRect mask_frame = clip;
+
         if (!_caLayerHosts)
             _caLayerHosts = [[NSMutableDictionary alloc] init];
 
-        [self removeCALayerHostView:contextId];
+        if (!CGRectIsNull(frame) && !self.layer.geometryFlipped)
+            frame.origin.y = bounds.size.height - frame.origin.y - frame.size.height;
+        if (!CGRectIsNull(clip))
+        {
+            mask_frame.origin.x -= top_frame.origin.x;
+            mask_frame.origin.y -= top_frame.origin.y;
+            if (!self.layer.geometryFlipped)
+                mask_frame.origin.y = top_frame.size.height - mask_frame.origin.y - mask_frame.size.height;
+        }
 
-        CALayerHost* host = [CALayerHost layer];
-        [host setContextId:contextId];
-        host.magnificationFilter = kCAFilterNearest;
-        host.contentsScale = retina_on ? 2.0 : 1.0;
-        host.frame = self.layer.bounds;
-        host.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
-
-        [self.layer addSublayer:host];
-        [_caLayerHosts setObject:host forKey:@(contextId)];
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        if (!(host = [_caLayerHosts objectForKey:@(contextId)]))
+        {
+            host = [CALayerHost layer];
+            [host setContextId:contextId];
+            host.magnificationFilter = kCAFilterNearest;
+            host.contentsScale = retina_on ? 2.0 : 1.0;
+            [self.layer addSublayer:host];
+            [_caLayerHosts setObject:host forKey:@(contextId)];
+        }
+        host.frame = CGRectIsNull(frame) ? bounds : frame;
+        host.autoresizingMask = CGRectIsNull(frame) ? kCALayerWidthSizable | kCALayerHeightSizable : kCALayerNotSizable;
+        host.masksToBounds = !CGRectIsNull(frame);
+        if (CGRectIsNull(clip)) host.mask = nil;
+        else
+        {
+            CALayer *mask = host.mask ?: [CALayer layer];
+            mask.frame = mask_frame;
+            mask.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+            host.mask = mask;
+        }
+        host.hidden = CGRectIsEmpty(host.frame) || (!CGRectIsNull(clip) && CGRectIsEmpty(clip));
+        host.zPosition = zPosition;
+        [CATransaction commit];
 
         [(WineWindow*)self.window windowDidDrawContent];
     }
@@ -3782,6 +3817,110 @@ void macdrv_view_release_metal_view(WineMetalView *view)
 
 @end
 
+@interface CAContextGDISurface : NSObject
+{
+    CALayer *content_layer;
+    CAContext *remote_context;
+    CAContextID context_id;
+}
+
+- (instancetype) initWithBounds:(CGRect)bounds;
+- (CAContextID) contextId;
+- (void) setImage:(CGImageRef)image;
+
+@end
+
+@implementation CAContextGDISurface
+
+- (instancetype) initWithBounds:(CGRect)bounds
+{
+    self = [super init];
+    if (!self) return nil;
+
+    content_layer = [[CALayer alloc] init];
+    if (!content_layer)
+    {
+        [self release];
+        return nil;
+    }
+    content_layer.contentsScale = retina_on ? 2.0 : 1.0;
+    content_layer.bounds = cgrect_mac_from_win(bounds);
+    content_layer.anchorPoint = CGPointMake(0, 0);
+    content_layer.magnificationFilter = kCAFilterNearest;
+
+    OnMainThread(^{
+        remote_context = [[CAContext contextWithCGSConnection:CGSMainConnectionID()
+                                                      options:[NSDictionary dictionary]] retain];
+        [remote_context setLayer:content_layer];
+        context_id = [remote_context contextId];
+    });
+    if (!remote_context || !context_id)
+    {
+        [self release];
+        return nil;
+    }
+    return self;
+}
+
+- (CAContextID) contextId
+{
+    return context_id;
+}
+
+- (void) setImage:(CGImageRef)image
+{
+    CALayer *layer = [content_layer retain];
+    CGImageRetain(image);
+    OnMainThreadAsync(^{
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        layer.contentsScale = retina_on ? 2.0 : 1.0;
+        layer.bounds = CGRectMake(0, 0, CGImageGetWidth(image) / layer.contentsScale,
+                                  CGImageGetHeight(image) / layer.contentsScale);
+        layer.contents = (id)image;
+        [CATransaction commit];
+        CGImageRelease(image);
+        [layer release];
+    });
+}
+
+- (void) dealloc
+{
+    CAContext *context = remote_context;
+    CALayer *layer = content_layer;
+    OnMainThreadAsync(^{
+        [context setLayer:nil];
+        [context release];
+        [layer release];
+    });
+    [super dealloc];
+}
+
+@end
+
+void *macdrv_create_gdi_context(CGRect bounds)
+{
+@autoreleasepool
+{
+    return [[CAContextGDISurface alloc] initWithBounds:bounds];
+}
+}
+
+unsigned int macdrv_gdi_context_id(void *context)
+{
+    return [(CAContextGDISurface *)context contextId];
+}
+
+void macdrv_gdi_context_set_image(void *context, CGImageRef image)
+{
+    [(CAContextGDISurface *)context setImage:image];
+}
+
+void macdrv_destroy_gdi_context(void *context)
+{
+    [(CAContextGDISurface *)context release];
+}
+
 id<WineMetalSwapChain> macdrv_create_view_swapchain(WineContentView *view)
 {
 @autoreleasepool
@@ -3823,6 +3962,19 @@ void macdrv_window_create_ca_layer_host_view(WineWindow *window, unsigned int co
 
         if ([content_view isKindOfClass:[WineContentView class]])
             [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id];
+    });
+}
+}
+
+void macdrv_window_create_ca_layer_host_view_frame(WineWindow *window, unsigned int context_id, CGRect frame, CGRect clip, float z)
+{
+@autoreleasepool
+{
+    OnMainThread(^{
+        NSView* content_view = [window contentView];
+
+        if ([content_view isKindOfClass:[WineContentView class]])
+            [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id frame:frame clip:clip zPosition:z];
     });
 }
 }

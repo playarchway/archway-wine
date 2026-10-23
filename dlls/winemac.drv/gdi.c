@@ -281,9 +281,12 @@ static const struct user_driver_funcs macdrv_funcs =
     .pWindowMessage = macdrv_WindowMessage,
     .pWindowPosChanged = macdrv_WindowPosChanged,
     .pWindowPosChanging = macdrv_WindowPosChanging,
+    .pAllowDetachedChildSurface = macdrv_AllowDetachedChildSurface,
     .pGetWindowStyleMasks = macdrv_GetWindowStyleMasks,
     .pCreateClientSurface = macdrv_CreateClientSurface,
     .pCreateWindowSurface = macdrv_CreateWindowSurface,
+    .pGetForeignWindowSurface = macdrv_GetForeignWindowSurface,
+    .pWindowSurfaceChanged = macdrv_WindowSurfaceChanged,
     .pVulkanInit = macdrv_VulkanInit,
     .pOpenGLInit = macdrv_OpenGLInit,
 };

@@ -41,6 +41,7 @@ struct dce
     HWND        hwnd;
     HRGN        clip_rgn;
     UINT        flags;
+    BOOL        foreign_surface_refresh;
     LONG        count;         /* usage count; 0 or 1 for cache DCEs, always 1 for window DCEs,
                                   always >= 1 for class DCEs */
 };
@@ -85,6 +86,39 @@ static const struct window_surface_funcs dummy_surface_funcs =
 struct window_surface dummy_surface =
 {
     .funcs = &dummy_surface_funcs,
+    .ref = 1,
+    .rect = {.right = 1, .bottom = 1},
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static BOOL failed_foreign_surface_begin( struct window_surface *surface )
+{
+    return FALSE;
+}
+
+static void failed_foreign_surface_end( struct window_surface *surface )
+{
+}
+
+static BOOL failed_foreign_surface_current( struct window_surface *surface )
+{
+    return FALSE;
+}
+
+static const struct window_surface_funcs failed_foreign_surface_funcs =
+{
+    .size = 0,
+    .set_clip = dummy_surface_set_clip,
+    .flush = dummy_surface_flush,
+    .destroy = dummy_surface_destroy,
+    .begin_pixel_access = failed_foreign_surface_begin,
+    .end_pixel_access = failed_foreign_surface_end,
+    .is_current = failed_foreign_surface_current,
+};
+
+static struct window_surface failed_foreign_surface =
+{
+    .funcs = &failed_foreign_surface_funcs,
     .ref = 1,
     .rect = {.right = 1, .bottom = 1},
     .mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -286,6 +320,14 @@ void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_
         /* reuse the underlying driver surface only if it also matches the target monitor rect */
         if (EqualRect( &driver_surface->rect, &monitor_rect )) window_surface_add_ref( driver_surface );
         else window_surface_add_ref( (driver_surface = &dummy_surface) );
+    }
+
+    /* A published raw surface cannot become a private target of a scaled surface. */
+    if (driver_surface == *window_surface && driver_surface && driver_surface->shared_id[0] &&
+        memcmp( &dpi, &monitor_dpi, sizeof(dpi) ))
+    {
+        window_surface_release( driver_surface );
+        window_surface_add_ref( (driver_surface = &dummy_surface) );
     }
 
     if (!user_driver->pCreateWindowSurface( hwnd, create_layered, &monitor_rect, &driver_surface ))
@@ -552,8 +594,9 @@ static void *window_surface_get_color( struct window_surface *surface, BITMAPINF
     return gdi_bits.ptr;
 }
 
-struct window_surface *window_surface_create( const struct window_surface_funcs *funcs, HWND hwnd,
-                                              const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
+static struct window_surface *create_window_surface_bitmap( const struct window_surface_funcs *funcs, HWND hwnd,
+                                                            const RECT *rect, BITMAPINFO *info, HBITMAP bitmap,
+                                                            BOOL initialize )
 {
     struct window_surface *surface;
 
@@ -576,10 +619,22 @@ struct window_surface *window_surface_create( const struct window_surface_funcs 
 
     pthread_mutex_init( &surface->mutex, NULL );
 
-    memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
+    if (initialize) memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
 
     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
     return surface;
+}
+
+struct window_surface *window_surface_create( const struct window_surface_funcs *funcs, HWND hwnd,
+                                              const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
+{
+    return create_window_surface_bitmap( funcs, hwnd, rect, info, bitmap, TRUE );
+}
+
+struct window_surface *window_surface_create_existing( const struct window_surface_funcs *funcs, HWND hwnd,
+                                                       const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
+{
+    return create_window_surface_bitmap( funcs, hwnd, rect, info, bitmap, FALSE );
 }
 
 void window_surface_add_ref( struct window_surface *surface )
@@ -826,6 +881,7 @@ static void update_visible_region( struct dce *dce )
     size_t size = 256;
     RECT win_rect, top_rect;
     WND *win;
+    BOOL retry_foreign = FALSE;
 
     /* don't clip siblings if using parent clip region */
     if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
@@ -860,7 +916,13 @@ static void update_visible_region( struct dce *dce )
         free( data );
     } while (status == STATUS_BUFFER_OVERFLOW);
 
-    if (status || !vis_rgn) return;
+    if (status || !vis_rgn)
+    {
+        if (dce->foreign_surface_refresh)
+            set_visible_region( dce->hdc, 0, &failed_foreign_surface.rect,
+                                &failed_foreign_surface.rect, &failed_foreign_surface );
+        return;
+    }
 
     user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags );
 
@@ -871,7 +933,20 @@ static void update_visible_region( struct dce *dce )
     if (!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW))
     {
         win = get_win_ptr( top_win );
-        if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+        if (win == WND_OTHER_PROCESS)
+        {
+            struct window_surface *previous = NULL;
+            DC *dc = get_dc_ptr( dce->hdc );
+
+            if (dc)
+            {
+                previous = dibdrv_get_window_surface( dc );
+                release_dc_ptr( dc );
+            }
+            surface = user_driver->pGetForeignWindowSurface( top_win, previous, &retry_foreign );
+            if (previous) window_surface_release( previous );
+        }
+        else if (win && win != WND_DESKTOP)
         {
             surface = win->surface;
             if (surface) window_surface_add_ref( surface );
@@ -879,6 +954,12 @@ static void update_visible_region( struct dce *dce )
         }
     }
 
+    if (retry_foreign && !surface)
+    {
+        surface = &failed_foreign_surface;
+        window_surface_add_ref( surface );
+    }
+    dce->foreign_surface_refresh = retry_foreign;
     if (!surface) SetRectEmpty( &top_rect );
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
     if (surface) window_surface_release( surface );
@@ -897,6 +978,7 @@ static void release_dce( struct dce *dce )
     if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );
     dce->clip_rgn = 0;
     dce->hwnd     = 0;
+    dce->foreign_surface_refresh = FALSE;
     dce->flags   &= DCX_CACHE;
 }
 
@@ -949,7 +1031,8 @@ BOOL delete_dce( struct dce *dce )
  */
 void update_dc( DC *dc )
 {
-    if (!dc->dirty) return;
+    if (!dc->dirty && (!dc->dce || !dc->dce->foreign_surface_refresh) &&
+        dibdrv_window_surface_is_current( dc )) return;
     dc->dirty = 0;
     if (dc->dce)
     {
@@ -975,6 +1058,7 @@ static struct dce *alloc_dce(void)
         return 0;
     }
     dce->hwnd      = 0;
+    dce->foreign_surface_refresh = FALSE;
     dce->clip_rgn  = 0;
     dce->flags     = 0;
     dce->count     = 1;

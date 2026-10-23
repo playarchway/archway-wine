@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -34,6 +35,734 @@
 #endif
 
 static HWND hwnd_cache, hwnd_owndc, hwnd_classdc, hwnd_classdc2, hwnd_parent, hwnd_parentdc;
+
+static LRESULT CALLBACK detached_gdi_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    PAINTSTRUCT ps;
+
+    if (msg == WM_PAINT)
+    {
+        BeginPaint( hwnd, &ps );
+        EndPaint( hwnd, &ps );
+        return 0;
+    }
+    return DefWindowProcA( hwnd, msg, wparam, lparam );
+}
+
+static BOOL paint_gdi_bands_dc( HDC hdc )
+{
+    RECT left = { 0, 0, 32, 64 }, right = { 32, 0, 64, 64 };
+    HBRUSH red, blue;
+    BOOL ret = FALSE;
+
+    red = CreateSolidBrush( RGB(255, 0, 0) );
+    blue = CreateSolidBrush( RGB(0, 0, 255) );
+    ok( !!red && !!blue, "CreateSolidBrush failed\n" );
+    if (red && blue)
+    {
+        ret = FillRect( hdc, &left, red ) && FillRect( hdc, &right, blue );
+        ok( ret, "FillRect failed\n" );
+        ok( GdiFlush(), "GdiFlush failed\n" );
+    }
+    if (red) DeleteObject( red );
+    if (blue) DeleteObject( blue );
+    return ret;
+}
+
+static BOOL paint_gdi_bands( HWND hwnd )
+{
+    HDC hdc = GetDC( hwnd );
+    BOOL ret;
+
+    ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+    if (!hdc) return FALSE;
+    ret = paint_gdi_bands_dc( hdc );
+    ok( ReleaseDC( hwnd, hdc ), "ReleaseDC failed\n" );
+    return ret;
+}
+
+static BOOL check_gdi_bands( HWND hwnd )
+{
+    COLORREF left, right;
+    HDC hdc = GetDC( hwnd );
+
+    ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+    if (!hdc) return FALSE;
+    left = GetPixel( hdc, 16, 32 );
+    right = GetPixel( hdc, 48, 32 );
+    ok( left == RGB(255, 0, 0), "left pixel is %#lx\n", left );
+    ok( right == RGB(0, 0, 255), "right pixel is %#lx\n", right );
+    ok( ReleaseDC( hwnd, hdc ), "ReleaseDC failed\n" );
+    return left == RGB(255, 0, 0) && right == RGB(0, 0, 255);
+}
+
+static BOOL check_gdi_pixel( HDC hdc, int x, int y, COLORREF expected )
+{
+    COLORREF color = GetPixel( hdc, x, y );
+
+    ok( color == expected, "pixel at %d,%d is %#lx, expected %#lx\n", x, y, color, expected );
+    return color == expected;
+}
+
+static DWORD wait_for_gdi_objects( DWORD count, const HANDLE *objects )
+{
+    DWORD start = GetTickCount(), ret, elapsed;
+    MSG msg;
+
+    for (;;)
+    {
+        elapsed = GetTickCount() - start;
+        if (elapsed >= 5000) return WAIT_TIMEOUT;
+        ret = MsgWaitForMultipleObjects( count, objects, FALSE, 5000 - elapsed, QS_ALLINPUT );
+        if (ret != WAIT_OBJECT_0 + count) return ret;
+        while (PeekMessageA( &msg, 0, 0, 0, PM_REMOVE ))
+        {
+            TranslateMessage( &msg );
+            DispatchMessageA( &msg );
+        }
+    }
+}
+
+static void test_detached_gdi_child( HWND parent, BOOL cross_process )
+{
+    WNDCLASSA cls = {0};
+    LONG_PTR style;
+    DWORD parent_pid = 0, child_pid = 0;
+    HWND child, previous, actual_parent;
+    POINT point = {0};
+    RECT rect;
+
+    cls.lpfnWndProc = detached_gdi_wndproc;
+    cls.hInstance = GetModuleHandleA( NULL );
+    cls.lpszClassName = "detached_gdi_child_class";
+    ok( RegisterClassA( &cls ), "RegisterClassA failed, error %lu\n", GetLastError() );
+    child = CreateWindowExA( 0, cls.lpszClassName, NULL, WS_POPUP,
+                             0, 0, 64, 64, NULL, NULL, cls.hInstance, NULL );
+    ok( !!child, "CreateWindowExA failed, error %lu\n", GetLastError() );
+    if (!child) goto cleanup;
+
+    GetWindowThreadProcessId( parent, &parent_pid );
+    GetWindowThreadProcessId( child, &child_pid );
+    ok( parent_pid && (parent_pid != GetCurrentProcessId()) == cross_process,
+        "parent belongs to process %lu\n", parent_pid );
+    ok( child_pid == GetCurrentProcessId(), "child belongs to process %lu\n", child_pid );
+    ok( !GetParent( child ), "child unexpectedly has a parent\n" );
+
+    style = GetWindowLongPtrA( child, GWL_STYLE );
+    ok( style & WS_POPUP, "initial style is %#Ix\n", style );
+    ok( SetWindowLongPtrA( child, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD ) == style,
+        "SetWindowLongPtrA failed, error %lu\n", GetLastError() );
+    SetLastError( 0 );
+    previous = SetParent( child, parent );
+    ok( previous == GetDesktopWindow() || (!previous && !GetLastError()),
+        "SetParent returned %p, error %lu\n", previous, GetLastError() );
+    actual_parent = GetParent( child );
+    ok( actual_parent == parent, "GetParent returned %p, expected %p\n", actual_parent, parent );
+    if (actual_parent != parent) goto destroy;
+    ok( GetAncestor( child, GA_ROOT ) == parent, "unexpected root window\n" );
+    style = GetWindowLongPtrA( child, GWL_STYLE );
+    ok( (style & (WS_CHILD | WS_POPUP)) == WS_CHILD, "child style is %#Ix\n", style );
+
+    ok( SetWindowPos( child, NULL, 8, 12, 64, 64,
+                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED ),
+        "SetWindowPos failed, error %lu\n", GetLastError() );
+    MapWindowPoints( child, parent, &point, 1 );
+    ok( point.x == 8 && point.y == 12, "child offset is %ld,%ld\n", point.x, point.y );
+    ok( IsWindowVisible( child ), "child is not visible\n" );
+    UpdateWindow( child );
+    if (paint_gdi_bands( child )) check_gdi_bands( child );
+
+    ok( SetWindowPos( child, NULL, 12, 16, 68, 68, SWP_NOZORDER | SWP_NOACTIVATE ),
+        "moving or resizing child failed, error %lu\n", GetLastError() );
+    point.x = point.y = 0;
+    MapWindowPoints( child, parent, &point, 1 );
+    ok( point.x == 12 && point.y == 16, "moved child offset is %ld,%ld\n", point.x, point.y );
+    GetClientRect( child, &rect );
+    ok( rect.right == 68 && rect.bottom == 68, "resized client is %ldx%ld\n", rect.right, rect.bottom );
+    ShowWindow( child, SW_HIDE );
+    ok( !IsWindowVisible( child ), "child is still visible\n" );
+    ShowWindow( child, SW_SHOWNA );
+    ok( IsWindowVisible( child ), "child is still hidden\n" );
+    UpdateWindow( child );
+    if (paint_gdi_bands( child )) check_gdi_bands( child );
+
+destroy:
+    DestroyWindow( child );
+cleanup:
+    UnregisterClassA( cls.lpszClassName, cls.hInstance );
+}
+
+static void test_detached_child_gdi( char **argv )
+{
+    WNDCLASSA cls = {0};
+    STARTUPINFOA startup = {0};
+    PROCESS_INFORMATION info;
+    char cmdline[MAX_PATH * 2];
+    DWORD ret, exit_code;
+    int len;
+    HWND hwnd;
+
+    cls.lpfnWndProc = detached_gdi_wndproc;
+    cls.hInstance = GetModuleHandleA( NULL );
+    cls.lpszClassName = "detached_gdi_parent_class";
+    ok( RegisterClassA( &cls ), "RegisterClassA failed, error %lu\n", GetLastError() );
+    hwnd = CreateWindowExA( WS_EX_TOPMOST, cls.lpszClassName, NULL, WS_POPUP | WS_VISIBLE,
+                            GetSystemMetrics( SM_CXSCREEN ) / 2 - 48,
+                            GetSystemMetrics( SM_CYSCREEN ) / 2 - 48,
+                            96, 96, NULL, NULL, cls.hInstance, NULL );
+    ok( !!hwnd, "CreateWindowExA failed, error %lu\n", GetLastError() );
+    if (!hwnd)
+    {
+        UnregisterClassA( cls.lpszClassName, cls.hInstance );
+        return;
+    }
+    UpdateWindow( hwnd );
+    test_detached_gdi_child( hwnd, FALSE );
+
+    len = snprintf( cmdline, sizeof(cmdline), "\"%s\" %s detached_child_gdi %p", argv[0], argv[1], hwnd );
+    ok( len >= 0 && (size_t)len < sizeof(cmdline), "child command line is too long\n" );
+    if (len < 0 || (size_t)len >= sizeof(cmdline)) goto cleanup;
+    startup.cb = sizeof(startup);
+    if (!CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &info ))
+    {
+        ok( 0, "CreateProcessA failed, error %lu\n", GetLastError() );
+        goto cleanup;
+    }
+
+    ret = wait_for_gdi_objects( 1, &info.hProcess );
+    ok( ret == WAIT_OBJECT_0, "child wait returned %#lx\n", ret );
+    if (ret == WAIT_OBJECT_0)
+    {
+        if (GetExitCodeProcess( info.hProcess, &exit_code ))
+            ok( exit_code == 0, "child exited with status %#lx\n", exit_code );
+        else
+            ok( 0, "GetExitCodeProcess failed, error %lu\n", GetLastError() );
+    }
+    else
+    {
+        ok( TerminateProcess( info.hProcess, 1 ) || WaitForSingleObject( info.hProcess, 0 ) == WAIT_OBJECT_0,
+            "could not terminate child\n" );
+        ret = WaitForSingleObject( info.hProcess, 5000 );
+        ok( ret == WAIT_OBJECT_0, "child cleanup wait returned %#lx\n", ret );
+    }
+    CloseHandle( info.hThread );
+    CloseHandle( info.hProcess );
+
+cleanup:
+    DestroyWindow( hwnd );
+    UnregisterClassA( cls.lpszClassName, cls.hInstance );
+}
+
+static void direct_gdi_event_names( HWND hwnd, DWORD pid, char *proceed, char *done )
+{
+    snprintf( proceed, 80, "wine_dce_direct_%lu_%p_proceed", pid, hwnd );
+    snprintf( done, 80, "wine_dce_direct_%lu_%p_done", pid, hwnd );
+}
+
+static void direct_foreign_gdi_proc( HWND hwnd )
+{
+    RECT new_area = { 160, 64, 224, 96 };
+    char proceed_name[80], done_name[80];
+    HANDLE proceed = NULL, done = NULL;
+    DWORD owner_pid = 0, ret;
+    HBRUSH green;
+    HDC hdc;
+
+    GetWindowThreadProcessId( hwnd, &owner_pid );
+    ok( owner_pid && owner_pid != GetCurrentProcessId(), "window belongs to process %lu\n", owner_pid );
+    if (!owner_pid || owner_pid == GetCurrentProcessId()) return;
+    direct_gdi_event_names( hwnd, owner_pid, proceed_name, done_name );
+    proceed = OpenEventA( EVENT_ALL_ACCESS, FALSE, proceed_name );
+    done = OpenEventA( EVENT_ALL_ACCESS, FALSE, done_name );
+    ok( !!proceed && !!done, "OpenEventA failed, error %lu\n", GetLastError() );
+    if (!proceed || !done) goto cleanup;
+
+    winetest_push_context( "foreign DC acquired while owner hidden" );
+    ok( !IsWindowVisible( hwnd ), "owner is visible before GetDC\n" );
+    hdc = GetDC( hwnd );
+    ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+    winetest_pop_context();
+    if (!hdc) goto cleanup;
+    ok( SetEvent( done ), "SetEvent failed, error %lu\n", GetLastError() );
+    ret = WaitForSingleObject( proceed, 5000 );
+    ok( ret == WAIT_OBJECT_0, "parent show wait returned %#lx\n", ret );
+    if (ret != WAIT_OBJECT_0) goto release;
+    winetest_push_context( "foreign initial drawing after show" );
+    paint_gdi_bands_dc( hdc );
+    winetest_pop_context();
+    ok( SetEvent( done ), "SetEvent failed, error %lu\n", GetLastError() );
+
+    ret = WaitForSingleObject( proceed, 5000 );
+    ok( ret == WAIT_OBJECT_0, "parent white write wait returned %#lx\n", ret );
+    if (ret != WAIT_OBJECT_0) goto release;
+    winetest_push_context( "foreign destination ROP" );
+    check_gdi_pixel( hdc, 16, 32, RGB(255, 255, 255) );
+    check_gdi_pixel( hdc, 48, 32, RGB(255, 255, 255) );
+    ok( PatBlt( hdc, 0, 0, 64, 64, DSTINVERT ), "PatBlt DSTINVERT failed\n" );
+    ok( GdiFlush(), "GdiFlush failed\n" );
+    check_gdi_pixel( hdc, 16, 32, RGB(0, 0, 0) );
+    check_gdi_pixel( hdc, 48, 32, RGB(0, 0, 0) );
+    winetest_pop_context();
+    ok( SetEvent( done ), "SetEvent failed, error %lu\n", GetLastError() );
+
+    ret = WaitForSingleObject( proceed, 5000 );
+    ok( ret == WAIT_OBJECT_0, "parent small resize wait returned %#lx\n", ret );
+    if (ret != WAIT_OBJECT_0) goto release;
+    winetest_push_context( "foreign retained DC after small resize" );
+    ok( SetPixel( hdc, 100, 80, RGB(0, 255, 0) ) == RGB(0, 255, 0),
+        "SetPixel in newly exposed client area failed\n" );
+    ok( GdiFlush(), "GdiFlush failed\n" );
+    check_gdi_pixel( hdc, 100, 80, RGB(0, 255, 0) );
+    winetest_pop_context();
+    ok( SetEvent( done ), "SetEvent failed, error %lu\n", GetLastError() );
+
+    ret = WaitForSingleObject( proceed, 5000 );
+    ok( ret == WAIT_OBJECT_0, "parent large resize wait returned %#lx\n", ret );
+    if (ret != WAIT_OBJECT_0) goto release;
+    winetest_push_context( "foreign retained DC after resize" );
+    green = CreateSolidBrush( RGB(0, 255, 0) );
+    ok( !!green, "CreateSolidBrush failed\n" );
+    if (green)
+    {
+        ok( FillRect( hdc, &new_area, green ), "FillRect in new area failed\n" );
+        ok( GdiFlush(), "GdiFlush failed\n" );
+        check_gdi_pixel( hdc, 180, 80, RGB(0, 255, 0) );
+        DeleteObject( green );
+    }
+    winetest_pop_context();
+    ok( SetEvent( done ), "SetEvent failed, error %lu\n", GetLastError() );
+
+    ret = WaitForSingleObject( proceed, 5000 );
+    ok( ret == WAIT_OBJECT_0, "parent destruction wait returned %#lx\n", ret );
+    if (ret != WAIT_OBJECT_0) goto release;
+    winetest_push_context( "foreign DC after owner destruction" );
+    GetPixel( hdc, 16, 32 );
+    GdiFlush();
+    ReleaseDC( hwnd, hdc );
+    winetest_pop_context();
+    goto cleanup;
+
+release:
+    ReleaseDC( hwnd, hdc );
+cleanup:
+    if (done) CloseHandle( done );
+    if (proceed) CloseHandle( proceed );
+}
+
+static void test_direct_foreign_gdi( char **argv )
+{
+    WNDCLASSA cls = {0};
+    STARTUPINFOA startup = {0};
+    PROCESS_INFORMATION info = {0};
+    char proceed_name[80], done_name[80], cmdline[MAX_PATH * 2];
+    HANDLE proceed = NULL, done = NULL, objects[2];
+    DWORD ret, exit_code;
+    BOOL finished = FALSE, terminated = FALSE, cleared = FALSE;
+    BOOL signaled, destroyed, resized = FALSE;
+    HWND hwnd = NULL;
+    HDC hdc;
+    RECT rect;
+    int len;
+
+    cls.style = CS_OWNDC;
+    cls.lpfnWndProc = detached_gdi_wndproc;
+    cls.hInstance = GetModuleHandleA( NULL );
+    cls.lpszClassName = "direct_foreign_gdi_class";
+    ok( RegisterClassA( &cls ), "RegisterClassA failed, error %lu\n", GetLastError() );
+    hwnd = CreateWindowExA( WS_EX_TOPMOST, cls.lpszClassName, NULL, WS_POPUP | WS_VISIBLE,
+                            GetSystemMetrics( SM_CXSCREEN ) / 2 - 150,
+                            GetSystemMetrics( SM_CYSCREEN ) / 2 - 90,
+                            96, 96, NULL, NULL, cls.hInstance, NULL );
+    ok( !!hwnd, "CreateWindowExA failed, error %lu\n", GetLastError() );
+    if (!hwnd) goto cleanup;
+    UpdateWindow( hwnd );
+
+    winetest_push_context( "direct same-process control" );
+    if (!paint_gdi_bands( hwnd ) || !check_gdi_bands( hwnd ))
+    {
+        winetest_pop_context();
+        goto cleanup;
+    }
+    hdc = GetDC( hwnd );
+    ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+    if (hdc)
+    {
+        ok( PatBlt( hdc, 0, 0, 64, 64, WHITENESS ), "PatBlt WHITENESS failed\n" );
+        ok( GdiFlush(), "GdiFlush failed\n" );
+        cleared = check_gdi_pixel( hdc, 16, 32, RGB(255, 255, 255) );
+        cleared &= check_gdi_pixel( hdc, 48, 32, RGB(255, 255, 255) );
+        ReleaseDC( hwnd, hdc );
+    }
+    winetest_pop_context();
+    if (!cleared) goto cleanup;
+
+    ShowWindow( hwnd, SW_HIDE );
+    ok( !IsWindowVisible( hwnd ), "owner is still visible\n" );
+    direct_gdi_event_names( hwnd, GetCurrentProcessId(), proceed_name, done_name );
+    proceed = CreateEventA( NULL, FALSE, FALSE, proceed_name );
+    done = CreateEventA( NULL, FALSE, FALSE, done_name );
+    ok( !!proceed && !!done, "CreateEventA failed, error %lu\n", GetLastError() );
+    if (!proceed || !done) goto cleanup;
+    len = snprintf( cmdline, sizeof(cmdline), "\"%s\" %s direct_foreign_gdi %p", argv[0], argv[1], hwnd );
+    ok( len >= 0 && (size_t)len < sizeof(cmdline), "child command line is too long\n" );
+    if (len < 0 || (size_t)len >= sizeof(cmdline)) goto cleanup;
+    startup.cb = sizeof(startup);
+    if (!CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &info ))
+    {
+        ok( 0, "CreateProcessA failed, error %lu\n", GetLastError() );
+        goto cleanup;
+    }
+    objects[0] = done;
+    objects[1] = info.hProcess;
+
+    winetest_push_context( "direct foreign DC acquired before owner show" );
+    ret = wait_for_gdi_objects( 2, objects );
+    ok( ret == 0, "child DC acquisition wait returned %#lx\n", ret );
+    if (ret == 0)
+    {
+        ShowWindow( hwnd, SW_SHOWNA );
+        ok( IsWindowVisible( hwnd ), "owner is still hidden\n" );
+        UpdateWindow( hwnd );
+        cleared = FALSE;
+        hdc = GetDC( hwnd );
+        ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+        if (hdc)
+        {
+            ok( PatBlt( hdc, 0, 0, 64, 64, WHITENESS ), "PatBlt WHITENESS failed\n" );
+            ok( GdiFlush(), "GdiFlush failed\n" );
+            cleared = check_gdi_pixel( hdc, 16, 32, RGB(255, 255, 255) );
+            cleared &= check_gdi_pixel( hdc, 48, 32, RGB(255, 255, 255) );
+            ReleaseDC( hwnd, hdc );
+        }
+    }
+    winetest_pop_context();
+    if (ret != 0 || !cleared) goto cleanup;
+    signaled = SetEvent( proceed );
+    ok( signaled, "SetEvent failed, error %lu\n", GetLastError() );
+    if (!signaled) goto cleanup;
+
+    winetest_push_context( "direct child writes, owner reads" );
+    ret = wait_for_gdi_objects( 2, objects );
+    ok( ret == 0, "child drawing wait returned %#lx\n", ret );
+    if (ret == 0)
+    {
+        check_gdi_bands( hwnd );
+        cleared = FALSE;
+        hdc = GetDC( hwnd );
+        ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+        if (hdc)
+        {
+            ok( PatBlt( hdc, 0, 0, 64, 64, WHITENESS ), "PatBlt WHITENESS failed\n" );
+            ok( GdiFlush(), "GdiFlush failed\n" );
+            cleared = check_gdi_pixel( hdc, 16, 32, RGB(255, 255, 255) );
+            cleared &= check_gdi_pixel( hdc, 48, 32, RGB(255, 255, 255) );
+            ReleaseDC( hwnd, hdc );
+        }
+    }
+    winetest_pop_context();
+    if (ret != 0 || !cleared) goto cleanup;
+    signaled = SetEvent( proceed );
+    ok( signaled, "SetEvent failed, error %lu\n", GetLastError() );
+    if (!signaled) goto cleanup;
+
+    winetest_push_context( "direct child destination ROP, owner reads" );
+    ret = wait_for_gdi_objects( 2, objects );
+    ok( ret == 0, "child ROP wait returned %#lx\n", ret );
+    if (ret == 0)
+    {
+        hdc = GetDC( hwnd );
+        ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+        if (hdc)
+        {
+            check_gdi_pixel( hdc, 16, 32, RGB(0, 0, 0) );
+            check_gdi_pixel( hdc, 48, 32, RGB(0, 0, 0) );
+            ReleaseDC( hwnd, hdc );
+        }
+        resized = SetWindowPos( hwnd, NULL, 0, 0, 104, 104,
+                                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE );
+        ok( resized, "SetWindowPos failed, error %lu\n", GetLastError() );
+        if (resized) UpdateWindow( hwnd );
+    }
+    winetest_pop_context();
+    if (ret != 0 || !resized) goto cleanup;
+    signaled = SetEvent( proceed );
+    ok( signaled, "SetEvent failed, error %lu\n", GetLastError() );
+    if (!signaled) goto cleanup;
+
+    winetest_push_context( "direct retained foreign DC after small resize" );
+    ret = wait_for_gdi_objects( 2, objects );
+    ok( ret == 0, "child small resize drawing wait returned %#lx\n", ret );
+    if (ret == 0)
+    {
+        hdc = GetDC( hwnd );
+        ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+        if (hdc)
+        {
+            check_gdi_pixel( hdc, 100, 80, RGB(0, 255, 0) );
+            ReleaseDC( hwnd, hdc );
+        }
+        resized = SetWindowPos( hwnd, NULL, 0, 0, 300, 180,
+                                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE );
+        ok( resized, "SetWindowPos failed, error %lu\n", GetLastError() );
+        if (resized)
+        {
+            UpdateWindow( hwnd );
+            GetClientRect( hwnd, &rect );
+            ok( rect.right >= 224 && rect.bottom >= 96,
+                "resized client is %ldx%ld\n", rect.right, rect.bottom );
+            winetest_push_context( "direct old pixels immediately after resize" );
+            hdc = GetDC( hwnd );
+            ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+            if (hdc)
+            {
+                check_gdi_pixel( hdc, 16, 32, RGB(0, 0, 0) );
+                ReleaseDC( hwnd, hdc );
+            }
+            winetest_pop_context();
+        }
+    }
+    winetest_pop_context();
+    if (ret != 0 || !resized) goto cleanup;
+    signaled = SetEvent( proceed );
+    ok( signaled, "SetEvent failed, error %lu\n", GetLastError() );
+    if (!signaled) goto cleanup;
+
+    winetest_push_context( "direct retained foreign DC after large resize" );
+    ret = wait_for_gdi_objects( 2, objects );
+    ok( ret == 0, "child resized drawing wait returned %#lx\n", ret );
+    if (ret == 0)
+    {
+        hdc = GetDC( hwnd );
+        ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+        if (hdc)
+        {
+            check_gdi_pixel( hdc, 180, 80, RGB(0, 255, 0) );
+            ReleaseDC( hwnd, hdc );
+        }
+    }
+    winetest_pop_context();
+    if (ret != 0) goto cleanup;
+
+    winetest_push_context( "direct foreign DC owner destruction" );
+    destroyed = DestroyWindow( hwnd );
+    ok( destroyed, "DestroyWindow failed, error %lu\n", GetLastError() );
+    if (destroyed) hwnd = NULL;
+    signaled = destroyed && SetEvent( proceed );
+    ok( signaled, "SetEvent after destruction failed, error %lu\n", GetLastError() );
+    if (!signaled)
+    {
+        winetest_pop_context();
+        goto cleanup;
+    }
+    ret = wait_for_gdi_objects( 1, &info.hProcess );
+    ok( ret == 0, "child exit wait returned %#lx\n", ret );
+    finished = ret == 0;
+    winetest_pop_context();
+
+cleanup:
+    if (info.hProcess)
+    {
+        if (!finished)
+        {
+            terminated = TerminateProcess( info.hProcess, 1 );
+            ret = wait_for_gdi_objects( 1, &info.hProcess );
+            ok( ret == 0, "child cleanup wait returned %#lx\n", ret );
+        }
+        if (ret == 0 && !terminated)
+        {
+            if (GetExitCodeProcess( info.hProcess, &exit_code ))
+                ok( exit_code == 0, "child exited with status %#lx\n", exit_code );
+            else
+                ok( 0, "GetExitCodeProcess failed, error %lu\n", GetLastError() );
+        }
+        CloseHandle( info.hThread );
+        CloseHandle( info.hProcess );
+    }
+    if (done) CloseHandle( done );
+    if (proceed) CloseHandle( proceed );
+    if (hwnd) DestroyWindow( hwnd );
+    UnregisterClassA( cls.lpszClassName, cls.hInstance );
+}
+
+static void stale_child_gdi_proc( HWND child )
+{
+    RECT rect = { 0, 0, 64, 64 };
+    char proceed_name[80], done_name[80];
+    HANDLE proceed = NULL, done = NULL;
+    DWORD owner_pid = 0, ret;
+    HBRUSH red;
+    HDC hdc;
+
+    GetWindowThreadProcessId( child, &owner_pid );
+    ok( owner_pid && owner_pid != GetCurrentProcessId(), "child belongs to process %lu\n", owner_pid );
+    if (!owner_pid || owner_pid == GetCurrentProcessId()) return;
+    direct_gdi_event_names( child, owner_pid, proceed_name, done_name );
+    proceed = OpenEventA( EVENT_ALL_ACCESS, FALSE, proceed_name );
+    done = OpenEventA( EVENT_ALL_ACCESS, FALSE, done_name );
+    ok( !!proceed && !!done, "OpenEventA failed, error %lu\n", GetLastError() );
+    if (!proceed || !done) goto cleanup;
+
+    hdc = GetDC( child );
+    ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+    if (!hdc) goto cleanup;
+    red = CreateSolidBrush( RGB(255, 0, 0) );
+    ok( !!red, "CreateSolidBrush failed\n" );
+    if (red)
+    {
+        ok( FillRect( hdc, &rect, red ), "FillRect failed\n" );
+        ok( GdiFlush(), "GdiFlush failed\n" );
+        DeleteObject( red );
+    }
+    ok( SetEvent( done ), "SetEvent failed, error %lu\n", GetLastError() );
+    ret = WaitForSingleObject( proceed, 5000 );
+    ok( ret == WAIT_OBJECT_0, "child destruction wait returned %#lx\n", ret );
+    if (ret == WAIT_OBJECT_0)
+    {
+        PatBlt( hdc, 0, 0, 64, 64, BLACKNESS );
+        GdiFlush();
+    }
+    ReleaseDC( child, hdc );
+
+cleanup:
+    if (done) CloseHandle( done );
+    if (proceed) CloseHandle( proceed );
+}
+
+static void test_stale_child_gdi( char **argv )
+{
+    WNDCLASSA cls = {0};
+    STARTUPINFOA startup = {0};
+    PROCESS_INFORMATION info = {0};
+    char proceed_name[80], done_name[80], cmdline[MAX_PATH * 2];
+    HANDLE proceed = NULL, done = NULL, objects[2];
+    DWORD ret, exit_code;
+    BOOL finished = FALSE, terminated = FALSE, cleared = FALSE;
+    BOOL destroyed, signaled;
+    HWND root = NULL, child = NULL;
+    HDC hdc;
+    int len;
+
+    cls.lpfnWndProc = detached_gdi_wndproc;
+    cls.hInstance = GetModuleHandleA( NULL );
+    cls.lpszClassName = "stale_child_gdi_class";
+    ok( RegisterClassA( &cls ), "RegisterClassA failed, error %lu\n", GetLastError() );
+    root = CreateWindowExA( WS_EX_TOPMOST, cls.lpszClassName, NULL, WS_POPUP | WS_VISIBLE,
+                            GetSystemMetrics( SM_CXSCREEN ) / 2 - 64,
+                            GetSystemMetrics( SM_CYSCREEN ) / 2 - 64,
+                            128, 128, NULL, NULL, cls.hInstance, NULL );
+    ok( !!root, "CreateWindowExA root failed, error %lu\n", GetLastError() );
+    if (!root) goto cleanup;
+    child = CreateWindowExA( 0, cls.lpszClassName, NULL, WS_CHILD | WS_VISIBLE,
+                             0, 0, 64, 64, root, NULL, cls.hInstance, NULL );
+    ok( !!child, "CreateWindowExA child failed, error %lu\n", GetLastError() );
+    if (!child) goto cleanup;
+    UpdateWindow( root );
+    UpdateWindow( child );
+
+    direct_gdi_event_names( child, GetCurrentProcessId(), proceed_name, done_name );
+    proceed = CreateEventA( NULL, FALSE, FALSE, proceed_name );
+    done = CreateEventA( NULL, FALSE, FALSE, done_name );
+    ok( !!proceed && !!done, "CreateEventA failed, error %lu\n", GetLastError() );
+    if (!proceed || !done) goto cleanup;
+    len = snprintf( cmdline, sizeof(cmdline), "\"%s\" %s stale_child_gdi %p", argv[0], argv[1], child );
+    ok( len >= 0 && (size_t)len < sizeof(cmdline), "child command line is too long\n" );
+    if (len < 0 || (size_t)len >= sizeof(cmdline)) goto cleanup;
+    startup.cb = sizeof(startup);
+    if (!CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &info ))
+    {
+        ok( 0, "CreateProcessA failed, error %lu\n", GetLastError() );
+        goto cleanup;
+    }
+    objects[0] = done;
+    objects[1] = info.hProcess;
+
+    winetest_push_context( "foreign child drawing before destruction" );
+    ret = wait_for_gdi_objects( 2, objects );
+    ok( ret == 0, "child drawing wait returned %#lx\n", ret );
+    if (ret == 0)
+    {
+        hdc = GetDC( child );
+        ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+        if (hdc)
+        {
+            check_gdi_pixel( hdc, 16, 16, RGB(255, 0, 0) );
+            ReleaseDC( child, hdc );
+        }
+    }
+    winetest_pop_context();
+    if (ret != 0) goto cleanup;
+
+    winetest_push_context( "foreign child DC after child destruction" );
+    destroyed = DestroyWindow( child );
+    ok( destroyed, "DestroyWindow child failed, error %lu\n", GetLastError() );
+    if (!destroyed)
+    {
+        winetest_pop_context();
+        goto cleanup;
+    }
+    child = NULL;
+    UpdateWindow( root );
+    hdc = GetDC( root );
+    ok( !!hdc, "GetDC root failed, error %lu\n", GetLastError() );
+    if (hdc)
+    {
+        ok( PatBlt( hdc, 0, 0, 64, 64, WHITENESS ), "PatBlt WHITENESS failed\n" );
+        ok( GdiFlush(), "GdiFlush failed\n" );
+        cleared = check_gdi_pixel( hdc, 16, 16, RGB(255, 255, 255) );
+        ReleaseDC( root, hdc );
+    }
+    if (!cleared)
+    {
+        winetest_pop_context();
+        goto cleanup;
+    }
+    signaled = SetEvent( proceed );
+    ok( signaled, "SetEvent failed, error %lu\n", GetLastError() );
+    if (!signaled)
+    {
+        winetest_pop_context();
+        goto cleanup;
+    }
+    ret = wait_for_gdi_objects( 1, &info.hProcess );
+    ok( ret == 0, "child exit wait returned %#lx\n", ret );
+    finished = ret == 0;
+    if (finished)
+    {
+        hdc = GetDC( root );
+        ok( !!hdc, "GetDC root failed, error %lu\n", GetLastError() );
+        if (hdc)
+        {
+            check_gdi_pixel( hdc, 16, 16, RGB(255, 255, 255) );
+            ReleaseDC( root, hdc );
+        }
+    }
+    winetest_pop_context();
+
+cleanup:
+    if (info.hProcess)
+    {
+        if (!finished)
+        {
+            terminated = TerminateProcess( info.hProcess, 1 );
+            ret = wait_for_gdi_objects( 1, &info.hProcess );
+            ok( ret == 0, "child cleanup wait returned %#lx\n", ret );
+        }
+        if (ret == 0 && !terminated)
+        {
+            if (GetExitCodeProcess( info.hProcess, &exit_code ))
+                ok( exit_code == 0, "child exited with status %#lx\n", exit_code );
+            else
+                ok( 0, "GetExitCodeProcess failed, error %lu\n", GetLastError() );
+        }
+        CloseHandle( info.hThread );
+        CloseHandle( info.hProcess );
+    }
+    if (done) CloseHandle( done );
+    if (proceed) CloseHandle( proceed );
+    if (child) DestroyWindow( child );
+    if (root) DestroyWindow( root );
+    UnregisterClassA( cls.lpszClassName, cls.hInstance );
+}
 
 /* test behavior of DC attributes with various GetDC/ReleaseDC combinations */
 static void test_dc_attributes(void)
@@ -785,7 +1514,34 @@ static void test_destroyed_window(void)
 
 START_TEST(dce)
 {
+    char **argv;
+    int argc = winetest_get_mainargs( &argv );
     WNDCLASSA cls;
+
+    if (argc == 4 && !strcmp( argv[2], "detached_child_gdi" ))
+    {
+        HWND hwnd = NULL;
+
+        ok( sscanf( argv[3], "%p", &hwnd ) == 1, "invalid window handle %s\n", argv[3] );
+        if (hwnd) test_detached_gdi_child( hwnd, TRUE );
+        return;
+    }
+    if (argc == 4 && !strcmp( argv[2], "direct_foreign_gdi" ))
+    {
+        HWND hwnd = NULL;
+
+        ok( sscanf( argv[3], "%p", &hwnd ) == 1, "invalid window handle %s\n", argv[3] );
+        if (hwnd) direct_foreign_gdi_proc( hwnd );
+        return;
+    }
+    if (argc == 4 && !strcmp( argv[2], "stale_child_gdi" ))
+    {
+        HWND hwnd = NULL;
+
+        ok( sscanf( argv[3], "%p", &hwnd ) == 1, "invalid window handle %s\n", argv[3] );
+        if (hwnd) stale_child_gdi_proc( hwnd );
+        return;
+    }
 
     cls.style = CS_DBLCLKS;
     cls.lpfnWndProc = DefWindowProcA;
@@ -833,6 +1589,9 @@ START_TEST(dce)
     test_scroll_window();
     test_invisible_create();
     test_dc_layout();
+    test_detached_child_gdi( argv );
+    test_direct_foreign_gdi( argv );
+    test_stale_child_gdi( argv );
     /* this should be last */
     test_destroyed_window();
 }
