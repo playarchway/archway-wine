@@ -1393,6 +1393,10 @@ static BOOL alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
             if (!new) return FALSE;
             if (old) memcpy( new, old, old_module_count * sizeof(*new) );
             teb->ThreadLocalStoragePointer = new;
+#if defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+            if (teb->Instrumentation[0])
+                ((TEB *)teb->Instrumentation[0])->ThreadLocalStoragePointer = new;
+#endif
             TRACE( "thread %04lx tls block %p -> %p\n", HandleToULong(teb->ClientId.UniqueThread), old, new );
             /* FIXME: can't free old block here, should be freed at thread exit */
         }
@@ -1638,6 +1642,10 @@ static NTSTATUS alloc_thread_tls(void)
         TRACE( "slot %u: %u/%lu bytes at %p\n", i, size, dir->SizeOfZeroFill, pointers[i] );
     }
     NtCurrentTeb()->ThreadLocalStoragePointer = pointers;
+#if defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+    if (NtCurrentTeb()->Instrumentation[0])
+        ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = pointers;
+#endif
     return STATUS_SUCCESS;
 }
 
@@ -3997,6 +4005,10 @@ void WINAPI LdrShutdownThread(void)
     if ((pointers = NtCurrentTeb()->ThreadLocalStoragePointer))
     {
         NtCurrentTeb()->ThreadLocalStoragePointer = NULL;
+#if defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+        if (NtCurrentTeb()->Instrumentation[0])
+            ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = NULL;
+#endif
         for (i = 0; i < tls_module_count; i++) RtlFreeHeap( GetProcessHeap(), 0, pointers[i] );
         RtlFreeHeap( GetProcessHeap(), 0, pointers );
     }
@@ -4004,6 +4016,10 @@ void WINAPI LdrShutdownThread(void)
     NtCurrentTeb()->FlsSlots = NULL;
     RtlFreeHeap( GetProcessHeap(), 0, NtCurrentTeb()->TlsExpansionSlots );
     NtCurrentTeb()->TlsExpansionSlots = NULL;
+#if defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+    if (NtCurrentTeb()->Instrumentation[0])
+        ((TEB *)NtCurrentTeb()->Instrumentation[0])->TlsExpansionSlots = NULL;
+#endif
     RtlReleasePebLock();
 
     RtlLeaveCriticalSection( &loader_section );
@@ -4550,6 +4566,24 @@ void loader_init( CONTEXT *context, void **entry )
 
         wm = get_modref( NtCurrentTeb()->Peb->ImageBaseAddress );
     }
+
+#if defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+    /* Keep native GS TLS reads on expansion slots, as in the CrossOver native-GS path. */
+    if (NtCurrentTeb()->Instrumentation[0])
+    {
+        if (!NtCurrentTeb()->WowTebOffset)
+        {
+            if (!NtCurrentTeb()->TlsExpansionSlots)
+                NtCurrentTeb()->TlsExpansionSlots = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY,
+                        8 * sizeof(NtCurrentTeb()->Peb->TlsExpansionBitmapBits) * sizeof(void *) );
+            if (!NtCurrentTeb()->TlsExpansionSlots) NtTerminateProcess( GetCurrentProcess(), STATUS_NO_MEMORY );
+            ((TEB *)NtCurrentTeb()->Instrumentation[0])->TlsExpansionSlots = NtCurrentTeb()->TlsExpansionSlots;
+
+            if (!attach_done)
+                while (RtlFindClearBitsAndSet( NtCurrentTeb()->Peb->TlsBitmap, 1, 1 ) != ~0U);
+        }
+    }
+#endif
 
     NtCurrentTeb()->FlsSlots = fls_alloc_data();
 

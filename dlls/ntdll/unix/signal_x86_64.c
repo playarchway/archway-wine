@@ -792,7 +792,9 @@ static inline struct thread_data *init_handler( void *sigcontext )
     amd64_data->syscall_dispatch = 0; /* SYSCALL_DISPATCH_FILTER_ALLOW */
     if (fs32_sel) arch_prctl( ARCH_SET_FS, amd64_data->pthread_teb );
 #elif defined __APPLE__
+#ifndef ARCHWAY_D3DMETAL_NATIVE_GS
     _thread_set_tsd_base( (uint64_t)amd64_data->pthread_teb );
+#endif
 
     /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
      * instead of the user selector (cs64_sel: 0x2b, USER64_CS).
@@ -822,7 +824,7 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
         amd64_data->syscall_dispatch = 1;  /* SYSCALL_DISPATCH_FILTER_BLOCK */
         if (fs32_sel) __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
     }
-#elif defined __APPLE__
+#elif defined __APPLE__ && !defined(ARCHWAY_D3DMETAL_NATIVE_GS)
     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
         !is_inside_syscall( data, RSP_sig(sigcontext )))
         _thread_set_tsd_base( (uint64_t)data->teb );
@@ -1682,7 +1684,7 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
                    "jz 1f\n\t"
                    "movw %ax,%fs\n"
                    "1:\n\t"
-#elif defined __APPLE__
+#elif defined __APPLE__ && !defined(ARCHWAY_D3DMETAL_NATIVE_GS)
                    "movq %rcx,%r10\n\t"
                    "movq %r13,%rdi\n\t"
                    "xorl %esi,%esi\n\t"
@@ -2192,6 +2194,11 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
     if (!data->teb) return FALSE;
     if (CS_sig(ucontext) != cs64_sel) return FALSE;
     if (((ERROR_sig(ucontext) >> 1) & 0x09) == EXCEPTION_EXECUTE_FAULT) return FALSE;
+
+#if defined(__APPLE__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+    /* Native pthread GS is never switched to the TEB in this mode. */
+    return FALSE;
+#endif
 
 #ifdef __linux__
     if (user_shared_data->ProcessorFeatures[PF_RDWRFSGSBASE_AVAILABLE])
@@ -2913,7 +2920,16 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
 #elif defined(__NetBSD__)
     sysarch( X86_64_SET_GSBASE, &teb );
 #elif defined (__APPLE__)
+#ifdef ARCHWAY_D3DMETAL_NATIVE_GS
+    /* The native GS base stays in place for pthread and Apple's libraries. */
+    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Tib.Self), "n" (FIELD_OFFSET(TEB, Tib.Self)));
+    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->ThreadLocalStoragePointer), "n" (FIELD_OFFSET(TEB, ThreadLocalStoragePointer)));
+    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Peb), "n" (FIELD_OFFSET(TEB, Peb)));
+#endif
     thread_data->pthread_teb = mac_thread_gsbase();
+#ifdef ARCHWAY_D3DMETAL_NATIVE_GS
+    teb->Instrumentation[0] = thread_data->pthread_teb;
+#endif
 #else
 # error Please define setting %gs for your architecture
 #endif
@@ -3022,7 +3038,12 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
  */
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_gs_load") ":\n\t"
+#if defined(__APPLE__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+                   "movq %gs:0x30,%rcx\n\t"
+                   "movq 0x378(%rcx),%rcx\n\t"
+#else
                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+#endif
                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
@@ -3146,7 +3167,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "popq %r8\n\t"
                    "leaq -0x98(%rbp),%rcx\n"
                    "2:\n\t"
-#elif defined __APPLE__
+#elif defined __APPLE__ && !defined(ARCHWAY_D3DMETAL_NATIVE_GS)
                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
                    "xorl %esi,%esi\n\t"
                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
@@ -3204,7 +3225,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "movw %dx,%ss\n\t"
 # endif
                    "1:\n\t"
-#elif defined __APPLE__
+#elif defined __APPLE__ && !defined(ARCHWAY_D3DMETAL_NATIVE_GS)
                    "movq %rax,%r8\n\t"
                    "movq %rcx,%rdx\n\t"
                    "movq %r13,%rdi\n\t"            /* teb */
@@ -3301,7 +3322,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "popfq\n\t"
                    "iretq\n"
                    /* RESTORE_FLAGS_INSTRUMENTATION */
+#if defined(__APPLE__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+                   "2:\tmovq %gs:0x30,%r10\n\t"
+                   "movq 0x330(%r10),%r10\n\t"
+#else
                    "2:\tmovq %gs:0x330,%r10\n\t"  /* amd64_thread_data()->instrumentation_callback */
+#endif
                    "movq (%r10),%r10\n\t"
                    "test %r10,%r10\n\t"
                    "jz 3b\n\t"
@@ -3360,7 +3386,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
 
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
+#if defined(__APPLE__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+                   "movq %gs:0x30,%rcx\n\t"
+                   "movq 0x378(%rcx),%rcx\n\t"
+#else
                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+#endif
                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
@@ -3378,7 +3409,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
 __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "movq %rcx,%r10\n\t"
                    __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_gs_load") ":\n\t"
+#if defined(__APPLE__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+                   "movq %gs:0x30,%rcx\n\t"
+                   "movq 0x378(%rcx),%rcx\n\t"
+#else
                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+#endif
                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
@@ -3462,7 +3498,7 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "popq %r9\n\t"
                    "popq %r8\n\t"
                    "2:\n\t"
-#elif defined __APPLE__
+#elif defined __APPLE__ && !defined(ARCHWAY_D3DMETAL_NATIVE_GS)
                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
                    "xorl %esi,%esi\n\t"
                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
@@ -3500,7 +3536,7 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "movw %dx,%ss\n\t"
 # endif
                    "1:\n\t"
-#elif defined __APPLE__
+#elif defined __APPLE__ && !defined(ARCHWAY_D3DMETAL_NATIVE_GS)
                    "movq %rax,%rdx\n\t"
                    "movq %rcx,%r14\n\t"
                    "movq %r13,%rdi\n\t"            /* teb */

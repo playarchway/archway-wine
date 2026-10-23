@@ -1121,6 +1121,10 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
     close( data->wait_fd[1] );
     close( data->reply_fd );
     close( data->request_fd );
+#if defined(__APPLE__) && defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+    /* Darwin uses this native GS slot during pthread teardown. */
+    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (NULL), "n" (FIELD_OFFSET(TEB, Peb)));
+#endif
     pthread_exit( UIntToPtr(status) );
 }
 

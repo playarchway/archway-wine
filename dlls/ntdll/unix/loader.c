@@ -33,6 +33,9 @@
 #include <spawn.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(__APPLE__) && defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+#include <time.h>
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -1846,6 +1849,40 @@ static ULONG_PTR get_image_address(void)
     return 0;
 }
 
+#if defined(__APPLE__) && defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+static __thread struct tm localtime_tls;
+
+static struct tm *localtime_replacement( const time_t *timep )
+{
+    return localtime_r( timep, &localtime_tls );
+}
+
+static void hook_localtime(void)
+{
+    const struct
+    {
+        unsigned char jmp[8];
+        struct tm *(*dst)( const time_t * );
+    } jump = { { 0xff, 0x25, 0x02, 0, 0, 0, 0xcc, 0xcc }, localtime_replacement };
+    ULONG_PTR target = (ULONG_PTR)localtime, page;
+    size_t page_size, length;
+    long native_page_size = sysconf( _SC_PAGESIZE );
+
+    if (native_page_size <= 0) fatal_error( "failed to get page size for localtime hook\n" );
+    page_size = native_page_size;
+    page = target - target % page_size;
+    length = ((target - page + sizeof(jump) + page_size - 1) / page_size) * page_size;
+    if (mprotect( (void *)page, length, PROT_READ | PROT_WRITE | PROT_EXEC ))
+        fatal_error( "failed to make localtime writable: %s\n", strerror(errno) );
+
+    /* jmp *(rip + 2), followed by the absolute replacement address. */
+    memcpy( (void *)target, &jump, sizeof(jump) );
+    __builtin___clear_cache( (char *)target, (char *)target + sizeof(jump) );
+    if (mprotect( (void *)page, length, PROT_READ | PROT_EXEC ))
+        fatal_error( "failed to restore localtime protection: %s\n", strerror(errno) );
+}
+#endif
+
 /***********************************************************************
  *           start_main_thread
  */
@@ -1866,6 +1903,10 @@ static void start_main_thread(void)
     load_ntdll();
     load_wow64_ntdll( main_image_info.Machine );
     load_apiset_dll();
+#if defined(__APPLE__) && defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
+    /* Native GS slot 0x60 holds the PEB, so localtime must use separate storage. */
+    hook_localtime();
+#endif
     server_init_process_done();
 }
 
