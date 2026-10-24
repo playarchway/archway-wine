@@ -1850,36 +1850,42 @@ static ULONG_PTR get_image_address(void)
 }
 
 #if defined(__APPLE__) && defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
-static __thread struct tm localtime_tls;
+static __thread struct tm localtime_tls, gmtime_tls;
 
 static struct tm *localtime_replacement( const time_t *timep )
 {
     return localtime_r( timep, &localtime_tls );
 }
 
-static void hook_localtime(void)
+static struct tm *gmtime_replacement( const time_t *timep )
+{
+    return gmtime_r( timep, &gmtime_tls );
+}
+
+/* Redirects a libc function to a replacement. */
+static void hook_libc( struct tm *(*function)( const time_t * ), struct tm *(*replacement)( const time_t * ) )
 {
     const struct
     {
         unsigned char jmp[8];
         struct tm *(*dst)( const time_t * );
-    } jump = { { 0xff, 0x25, 0x02, 0, 0, 0, 0xcc, 0xcc }, localtime_replacement };
-    ULONG_PTR target = (ULONG_PTR)localtime, page;
+    } jump = { { 0xff, 0x25, 0x02, 0, 0, 0, 0xcc, 0xcc }, replacement };
+    ULONG_PTR target = (ULONG_PTR)function, page;
     size_t page_size, length;
     long native_page_size = sysconf( _SC_PAGESIZE );
 
-    if (native_page_size <= 0) fatal_error( "failed to get page size for localtime hook\n" );
+    if (native_page_size <= 0) fatal_error( "failed to get page size for libc hook\n" );
     page_size = native_page_size;
     page = target - target % page_size;
     length = ((target - page + sizeof(jump) + page_size - 1) / page_size) * page_size;
     if (mprotect( (void *)page, length, PROT_READ | PROT_WRITE | PROT_EXEC ))
-        fatal_error( "failed to make localtime writable: %s\n", strerror(errno) );
+        fatal_error( "failed to make libc code writable: %s\n", strerror(errno) );
 
     /* jmp *(rip + 2), followed by the absolute replacement address. */
     memcpy( (void *)target, &jump, sizeof(jump) );
     __builtin___clear_cache( (char *)target, (char *)target + sizeof(jump) );
     if (mprotect( (void *)page, length, PROT_READ | PROT_EXEC ))
-        fatal_error( "failed to restore localtime protection: %s\n", strerror(errno) );
+        fatal_error( "failed to restore libc code protection: %s\n", strerror(errno) );
 }
 #endif
 
@@ -1904,8 +1910,10 @@ static void start_main_thread(void)
     load_wow64_ntdll( main_image_info.Machine );
     load_apiset_dll();
 #if defined(__APPLE__) && defined(__x86_64__) && defined(ARCHWAY_D3DMETAL_NATIVE_GS)
-    /* Native GS slot 0x60 holds the PEB, so localtime must use separate storage. */
-    hook_localtime();
+    /* Native GS slots 0x60 and 0x68 hold the PEB and the last error, which libc's localtime and
+     * gmtime use for their result buffers, so give both separate storage, as CrossOver does. */
+    hook_libc( localtime, localtime_replacement );
+    hook_libc( gmtime, gmtime_replacement );
 #endif
     server_init_process_done();
 }
