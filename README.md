@@ -1,3 +1,17 @@
+# Wine for Archway
+
+This is the Wine that [Archway](https://github.com/playarchway/archway) runs Windows games with on Apple silicon Macs: Wine 11.20 with a few macOS patches. Archway builds it into a [runtime package](https://github.com/playarchway/archway/blob/main/docs/RUNTIME.md) together with FreeType, Wine Mono, and Apple's D3DMetal.
+
+Changes on top of Wine 11.20:
+
+- **win32u, winemac.drv: Present cross-process child windows on macOS.** A window drawn by another process, such as Chromium's GPU process inside Steam's webhelper, had no window surface, so it stayed black.
+- **winemac.drv: Export a D3DMetal compatibility table.** D3DMetal looks for CrossOver's `macdrv_functions` table; this implements its 24 entries on upstream Wine.
+- **ntdll: Keep the native pthread GS base for D3DMetal threads on macOS**, and **give gmtime its own storage under native GS**, so threads that D3DMetal creates outside Wine don't crash.
+
+The changes are licensed like the rest of Wine, under the GNU LGPL; see the file LICENSE. Wine's own README follows.
+
+---
+
 ## INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs
