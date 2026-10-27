@@ -25,6 +25,7 @@
 #include "ntgdi.h"
 #include "macdrv_res.h"
 #include "shellapi.h"
+#include "winver.h"
 #include "unixlib.h"
 #include "wine/debug.h"
 
@@ -369,9 +370,52 @@ cleanup:
 }
 
 
+/***********************************************************************
+ *              get_app_name
+ *
+ * Name the process after its Windows program: the version resource's product
+ * name or file description, or else the file name without its extension.
+ */
+static void get_app_name(WCHAR *buffer, UINT size)
+{
+    static const WCHAR *const keys[] = { L"ProductName", L"FileDescription" };
+    WCHAR path[MAX_PATH], query[64], *name, *ext;
+    struct { WORD lang, codepage; } *translation;
+    DWORD info_size;
+    void *info;
+    UINT len, i;
+
+    *buffer = 0;
+    if (!GetModuleFileNameW(NULL, path, ARRAYSIZE(path))) return;
+
+    if ((info_size = GetFileVersionInfoSizeW(path, NULL)) && (info = HeapAlloc(GetProcessHeap(), 0, info_size)))
+    {
+        if (GetFileVersionInfoW(path, 0, info_size, info) &&
+            VerQueryValueW(info, L"\\VarFileInfo\\Translation", (void **)&translation, &len) &&
+            len >= sizeof(*translation))
+        {
+            for (i = 0; i < ARRAYSIZE(keys) && !*buffer; i++)
+            {
+                swprintf(query, ARRAYSIZE(query), L"\\StringFileInfo\\%04x%04x\\%s",
+                         translation->lang, translation->codepage, keys[i]);
+                if (VerQueryValueW(info, query, (void **)&name, &len) && len)
+                    lstrcpynW(buffer, name, size);
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, info);
+        if (*buffer) return;
+    }
+
+    name = wcsrchr(path, '\\');
+    lstrcpynW(buffer, name ? name + 1 : path, size);
+    if ((ext = wcsrchr(buffer, '.')) && !wcsicmp(ext, L".exe")) *ext = 0;
+}
+
+
 static BOOL process_attach(void)
 {
     struct init_params params;
+    WCHAR app_name[256];
 
     struct localized_string *str;
     struct localized_string strings[] = {
@@ -399,6 +443,9 @@ static BOOL process_attach(void)
     params.strings = strings;
     params.app_icon_callback = (UINT_PTR)macdrv_app_icon;
     params.app_quit_request_callback = (UINT_PTR)macdrv_app_quit_request;
+    get_app_name(app_name, ARRAYSIZE(app_name));
+    params.app_name = (UINT_PTR)app_name;
+    params.app_name_len = wcslen(app_name);
 
     if (MACDRV_CALL(init, &params)) return FALSE;
 

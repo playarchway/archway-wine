@@ -6,6 +6,7 @@ Changes on top of Wine 11.20:
 
 - **win32u, winemac.drv: Present cross-process child windows on macOS.** A window drawn by another process, such as Chromium's GPU process inside Steam's webhelper, had no window surface, so it stayed black.
 - **winemac.drv: Export a D3DMetal compatibility table.** D3DMetal looks for CrossOver's `macdrv_functions` table; this implements its 24 entries on upstream Wine.
+- **winemac.drv: Name the process after its Windows program.** Every Wine process runs the same `wine` loader, so the Dock, the Command-Tab switcher and the menu bar called every game "wine". The driver now tells LaunchServices the program's product name, file description or file name.
 - **ntdll: Keep the native pthread GS base for D3DMetal threads on macOS**, and **give gmtime its own storage under native GS**, so threads that D3DMetal creates outside Wine don't crash.
 
 The changes are licensed like the rest of Wine, under the GNU LGPL; see the file LICENSE. Wine's own README follows.

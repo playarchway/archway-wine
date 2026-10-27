@@ -41,6 +41,8 @@ struct init_params
     struct localized_string *strings;
     UINT64 app_icon_callback;
     UINT64 app_quit_request_callback;
+    UINT64 app_name;
+    UINT app_name_len;
 };
 
 /* macdrv_quit_result params */

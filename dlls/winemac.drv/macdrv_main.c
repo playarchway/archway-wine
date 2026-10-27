@@ -59,6 +59,7 @@ UINT64 app_icon_callback = 0;
 UINT64 app_quit_request_callback = 0;
 
 CFDictionaryRef localized_strings;
+CFStringRef app_name;
 
 
 /**************************************************************************
@@ -430,6 +431,8 @@ static NTSTATUS macdrv_init(void *arg)
     init_win_context();
     setup_options();
     load_strings(params->strings);
+    if (params->app_name && params->app_name_len)
+        app_name = CFStringCreateWithCharacters(NULL, param_ptr(params->app_name), params->app_name_len);
 
     if (macdrv_start_cocoa_app(NtGetTickCount()))
     {
@@ -611,12 +614,16 @@ static NTSTATUS wow64_init(void *arg)
         ULONG strings;
         UINT64 app_icon_callback;
         UINT64 app_quit_request_callback;
+        UINT64 app_name;
+        UINT app_name_len;
     } *params32 = arg;
     struct init_params params;
 
     params.strings = UlongToPtr(params32->strings);
     params.app_icon_callback = params32->app_icon_callback;
     params.app_quit_request_callback = params32->app_quit_request_callback;
+    params.app_name = params32->app_name;
+    params.app_name_len = params32->app_name_len;
     return macdrv_init(&params);
 }
 

@@ -19,6 +19,7 @@
  */
 
 #import "config.h"
+#include <dlfcn.h>
 #import "macdrv.h"
 
 #import "cocoa_app.h"
@@ -70,6 +71,40 @@ static NSString* const WineActivatingAppConfigDirKey = @"ActivatingAppConfigDir"
 static NSString* WineLocalizedString(unsigned int stringID)
 {
     return ((NSDictionary*)localized_strings)[@(stringID)];
+}
+
+
+/***********************************************************************
+ *              SetApplicationDisplayName
+ *
+ * Every Wine process runs the same loader binary, so the Dock, the Command-Tab
+ * switcher and the menu bar would all call it "wine".  Tell LaunchServices the
+ * Windows program's name instead.  This uses private API, the same calls
+ * Chromium makes to name its helper processes; if they go away, the process
+ * keeps its default name.
+ */
+static void SetApplicationDisplayName(CFStringRef name)
+{
+    typedef CFTypeRef (*GetCurrentApplicationASNFunc)(void);
+    typedef OSStatus (*SetApplicationInformationItemFunc)(int, CFTypeRef, CFStringRef, CFTypeRef, CFDictionaryRef*);
+    static GetCurrentApplicationASNFunc pGetCurrentApplicationASN;
+    static SetApplicationInformationItemFunc pSetApplicationInformationItem;
+    static CFStringRef *pDisplayNameKey;
+    static dispatch_once_t once;
+    CFTypeRef asn;
+
+    dispatch_once(&once, ^{
+        void *launch_services = dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
+        if (!launch_services) return;
+        pGetCurrentApplicationASN = dlsym(launch_services, "_LSGetCurrentApplicationASN");
+        pSetApplicationInformationItem = dlsym(launch_services, "_LSSetApplicationInformationItem");
+        pDisplayNameKey = dlsym(launch_services, "_kLSDisplayNameKey");
+    });
+
+    if (!pGetCurrentApplicationASN || !pSetApplicationInformationItem || !pDisplayNameKey) return;
+    if (!(asn = pGetCurrentApplicationASN())) return;
+    /* -2 is kLSDefaultSessionID. */
+    pSetApplicationInformationItem(-2, asn, *pDisplayNameKey, name, NULL);
 }
 
 
@@ -232,6 +267,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             NSMenuItem* item;
 
             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+            if (app_name)
+                SetApplicationDisplayName(app_name);
 
             if (activateIfTransformed)
                 [self tryToActivateIgnoringOtherApps:YES];
@@ -247,6 +284,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             // Application menu
             submenu = [[[NSMenu alloc] initWithTitle:WineLocalizedString(STRING_MENU_WINE)] autorelease];
             bundleName = [[NSBundle mainBundle] objectForInfoDictionaryKey:(NSString*)kCFBundleNameKey];
+            if (![bundleName length])
+                bundleName = (NSString*)app_name;
 
             if ([bundleName length])
                 title = [NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_HIDE_APPNAME), bundleName];

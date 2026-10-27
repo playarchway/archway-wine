@@ -113,6 +113,7 @@ extern bool cursor_clipping_locks_windows;
 extern bool use_precise_scrolling;
 extern int gl_surface_mode;
 extern CFDictionaryRef localized_strings;
+extern CFStringRef app_name;  /* The Windows program's name, from its version resource or file name. */
 extern bool retina_enabled;  /* Whether Retina mode is enabled via registry setting. */
 extern bool retina_on;       /* Whether Retina mode is currently active (enabled and display is in default mode). */
 extern bool enable_app_nap;
