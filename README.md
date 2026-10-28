@@ -1,6 +1,6 @@
 # Wine for Archway
 
-This is the Wine that [Archway](https://github.com/playarchway/archway) runs Windows games with on Apple silicon Macs: Wine 11.20 with a few macOS patches. Archway builds it into a [runtime package](https://github.com/playarchway/archway/blob/main/docs/RUNTIME.md) together with FreeType, Wine Mono, and Apple's D3DMetal.
+This is the Wine that [Archway](https://github.com/playarchway/archway) runs Windows games with on Apple silicon Macs: [WineHQ's Wine](https://gitlab.winehq.org/wine/wine) 11.20 (tag `wine-11.20`) with a few macOS patches. It is not a separate project; the patches sit on top of Wine's full history and follow its releases. Archway builds it into a [runtime package](https://github.com/playarchway/archway/blob/main/docs/RUNTIME.md) together with FreeType, Wine Mono, and Apple's D3DMetal.
 
 Changes on top of Wine 11.20:
 
